@@ -129,11 +129,10 @@ def plot_iv_scatter(ax, df, title):
 
 def df_from_deribit_orderbooks(orderbooks: list):
     df = pd.DataFrame(orderbooks)
-    print(df)
 
     df["mid_price"] = ((df["bid_price"] + df["ask_price"]) / 2).where(
         df["bid_price"].notna() & df["ask_price"].notna(),
-        df["last"].where(df["mark_price"].notna(), df["mark_price"])
+        df["mark_price"]
     )
 
     # Parse expiry/strike/type from instrument_name like "ETH-26JUN26-4500-C"
@@ -153,7 +152,7 @@ def df_from_deribit_orderbooks(orderbooks: list):
 
     df["iv"] = find_iv_series(df, "mark")      
 
-    return df[["strike", "iv", "expiry", "dte", "option_type", "instrument_name"]].sort_values(["expiry","strike"])
+    return df[["strike", "iv", "expiry", "dte", "option_type", "instrument_name", "underlying_price"]].sort_values(["expiry","strike"])
 
 
 
@@ -182,27 +181,37 @@ def get_deribit_book_summaries(currency: str = "ETH"):
 
 
 def main():
-    currency = "ETH"
+    currency = "BTC"
     deribit_orderbooks = get_deribit_book_summaries(currency)
     deribit_df = df_from_deribit_orderbooks(deribit_orderbooks)
+    deribit_df = deribit_df.loc[(deribit_df["iv"] != 0) & (~deribit_df["iv"].isna())]
+
+    spot_price = deribit_df["underlying_price"].iloc[0]
+    deribit_otm = deribit_df[
+        ((deribit_df["option_type"] == "C") & (deribit_df["strike"] > spot_price)) |
+        ((deribit_df["option_type"] == "P") & (deribit_df["strike"] < spot_price))
+    ]
     deribit_calls = deribit_df[deribit_df["option_type"] == "C"]
     print(deribit_calls.head())
     deribit_puts  = deribit_df[deribit_df["option_type"] == "P"]
-    print(deribit_puts.sort_values("strike", ascending=False).head())
+    print(deribit_puts.sort_values("iv").head())
 
     fig1 = plt.figure(figsize=(9, 6))
 
     ax1 = fig1.add_subplot(121, projection="3d")
-    surf1 = plot_iv_surface(ax1, deribit_calls, f"Deribit - {currency} - Calls")
+    surf1 = plot_iv_surface(ax1, deribit_calls, f"Deribit - {currency} - Calls - Spot: {spot_price}")
     fig1.colorbar(surf1, ax=ax1, shrink=0.5, aspect=10, label="IV")
 
     ax2 = fig1.add_subplot(122, projection="3d")
-    surf2 = plot_iv_surface(ax2, deribit_puts, f"Deribit - {currency} - Puts")
+    surf2 = plot_iv_surface(ax2, deribit_puts, f"Deribit - {currency} - Puts - Spot: {spot_price}")
     fig1.colorbar(surf2, ax=ax2, shrink=0.5, aspect=10, label="IV")
+
+    fig1.subplots_adjust(left=0.02, right=0.98, bottom=0, top=1, wspace=0.1)
 
     fig2 = plt.figure(figsize=(9, 9))
     ax3 = fig2.add_subplot(111, projection="3d")
-    scatter1 = plot_iv_scatter(ax3, deribit_df, f"Deribit - {currency} - All Options")
+    # scatter1 = plot_iv_scatter(ax3, deribit_otm, f"Deribit - {currency} - OTM Puts and Calls")
+    surf3 = plot_iv_surface(ax3, deribit_otm, f"Deribit - {currency} - OTM Puts and Calls - Spot: {spot_price}")
 
     plt.tight_layout()
     plt.show()

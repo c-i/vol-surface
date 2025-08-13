@@ -9,6 +9,7 @@ from scipy.stats import norm
 from scipy.optimize import brentq, newton
 from datetime import datetime, timezone
 import argparse
+import py_vollib.black_scholes.implied_volatility as vollib_iv
 # import asyncio
 
 
@@ -26,7 +27,7 @@ def bs_price(S, K, t, sigma, opt):
         return K * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
-def implied_vol(price, S, K, t, opt, lo=1e-6, hi=5.0):
+def iv_brentq(price, S, K, t, opt, lo=1e-6, hi=5.0):
     # Reject impossible prices (below intrinsic or above simple bounds)
     intrinsic = max(S - K, 0.0) if opt == 'C' else max(K - S, 0.0)
     if price < intrinsic - 1e-12:
@@ -58,19 +59,40 @@ def implied_vol(price, S, K, t, opt, lo=1e-6, hi=5.0):
         return float('nan')
 
 
-def iv_newton(price, S, K, t, opt, x0):
+# def iv_newton(price, S, K, t, opt, x0):
+#     if t <= 0:
+#         return 0.0 if abs(price - intrinsic) < 1e-12 else float('nan')
+
+#     f = lambda sig: bs_price(S, K, t, sig, opt) - price
+#     try:
+#         return newton(f, x0, maxiter=100, tol=1e-12)
+#     except Exception as e:
+#         logging.error(f"newton failed: {e}")
+#         return float('nan')
+
+
+def iv_vollib(price, S, K, t, opt):
+    # Reject impossible prices (below intrinsic or above simple bounds)
+    intrinsic = max(S - K, 0.0) if opt == 'C' else max(K - S, 0.0)
+    if price < intrinsic - 1e-12:
+        return float('nan')
+    # For calls with r=0,q=0: upper bound ~ S; for puts: upper bound ~ K
+    if (opt == 'C' and price > S + 1e-12) or (opt == 'P' and price > K + 1e-12):
+        return float('nan')
     if t <= 0:
         return 0.0 if abs(price - intrinsic) < 1e-12 else float('nan')
 
-    f = lambda sig: bs_price(S, K, t, sig, opt) - price
-    try:
-        return newton(f, x0, maxiter=100, tol=1e-12)
-    except Exception as e:
-        logging.error(f"newton failed: {e}")
-        return float('nan')
+    return vollib_iv.implied_volatility(
+        price=price,
+        S=S,
+        K=K,
+        t=t,
+        r=0.0,
+        flag=opt.lower()
+    )
 
 
-def find_iv_series(df: pd.DataFrame, price_type: str) -> pd.Series:
+def find_iv_series(df: pd.DataFrame, price_type: str, use_vollib: bool) -> pd.Series:
     """
     df columns required: mark_price (float), dte (float), strike (float), underlying_price (float), option_type ('C' or 'P').
     dte_unit: 'days'.
@@ -92,14 +114,17 @@ def find_iv_series(df: pd.DataFrame, price_type: str) -> pd.Series:
 
     # Compute row-wise (brentq is scalar), loop over NumPy arrays
     ivs = np.empty(len(df), dtype=float)
-    for i in range(len(df)):
-        ivs[i] = implied_vol(price[i], spot[i], K[i], t[i], opt[i])
-        # ivs[i] = iv_newton(price[i], spot[i], K[i], t[i], opt[i], x0=0.2)
+    if use_vollib:
+        for i in range(len(df)):
+            ivs[i] = iv_vollib(price[i], spot[i], K[i], t[i], opt[i])
+    else:
+        for i in range(len(df)):
+            ivs[i] = iv_brentq(price[i], spot[i], K[i], t[i], opt[i])
 
     return pd.Series(ivs, index=df.index, name='iv')
 
 
-def df_from_deribit_orderbooks(orderbooks: list):
+def df_from_deribit_orderbooks(orderbooks: list, use_vollib: bool):
     df = pd.DataFrame(orderbooks)
 
     df["mid_price"] = ((df["bid_price"] + df["ask_price"]) / 2).where(
@@ -122,7 +147,7 @@ def df_from_deribit_orderbooks(orderbooks: list):
     dte_seconds = (df["expiry"].dt.tz_localize("UTC") - df["now"]).dt.total_seconds()
     df["dte"] = dte_seconds / 86400.0
 
-    df["iv"] = find_iv_series(df, "mark")      
+    df["iv"] = find_iv_series(df, "mark", use_vollib)      
 
     return df[["strike", "iv", "expiry", "dte", "option_type", "instrument_name", "underlying_price"]].sort_values(["expiry","strike"])
 
@@ -186,6 +211,7 @@ def get_args():
     parser = argparse.ArgumentParser(description="Deribit IV Surface Plot")
     parser.add_argument("currencies", type=str, nargs="+", help="Currencies to plot separated by spaces. e.g. BTC ETH")
     parser.add_argument("--scatter", action="store_true", help="Use scatter plot instead of surface plot")
+    parser.add_argument("--jaeckel", action="store_true", help="Use py_vollib (Jaeckel's method) to calculate implied volatility")
     return parser.parse_args()
 
 
@@ -196,7 +222,7 @@ def main():
 
     for currency in currencies:
         deribit_orderbooks = get_deribit_book_summaries(currency)
-        deribit_df = df_from_deribit_orderbooks(deribit_orderbooks)
+        deribit_df = df_from_deribit_orderbooks(deribit_orderbooks, args.jaeckel)
         deribit_df = deribit_df.loc[(deribit_df["iv"] != 0) & (~deribit_df["iv"].isna())]
 
         spot_price = deribit_df["underlying_price"].iloc[0]
